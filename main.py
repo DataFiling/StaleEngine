@@ -99,6 +99,11 @@ def extract_listings_from_html(html: str) -> list:
             
             if list_results:
                 logger.info(f"Found {len(list_results)} listings via __NEXT_DATA__")
+                # Debug: log first listing's keys to see available fields
+                if list_results and len(list_results) > 0:
+                    first = list_results[0]
+                    logger.info(f"Sample listing keys: {list(first.keys())}")
+                    logger.info(f"Sample listing data: {json.dumps(first, default=str)[:1000]}")
                 return list_results
                 
         except json.JSONDecodeError as e:
