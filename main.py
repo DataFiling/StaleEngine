@@ -16,7 +16,8 @@ app = Flask(__name__)
 
 # --- CONFIGURATION ---
 API_KEY = os.getenv("RAPIDAPI_KEY")
-API_HOST = "zillow-com1.p.rapidapi.com"
+# Use Real-Time Zillow Data API (actively maintained) - switch if needed
+API_HOST = os.getenv("ZILLOW_API_HOST", "real-time-zillow-data.p.rapidapi.com")
 PORT = int(os.environ.get("PORT", 8080))
 
 # Thresholds
@@ -66,15 +67,18 @@ def search_properties(location: str, status: str = "ForSale", page: int = 1) -> 
     Returns raw API response or raises an exception.
     """
     session = get_http_session()
+    
+    # Real-Time Zillow Data API uses /propertyExtendedSearch or /search
     url = f"https://{API_HOST}/propertyExtendedSearch"
     
     params = {
         "location": location,
         "status_type": status,
-        "page": page
+        "page": page,
+        "home_type": "Houses"  # Focus on houses for investment leads
     }
     
-    logger.info(f"Searching properties: location={location}, status={status}, page={page}")
+    logger.info(f"Searching properties: host={API_HOST}, location={location}, status={status}, page={page}")
     
     response = session.get(
         url, 
@@ -163,8 +167,9 @@ def health_check():
     return jsonify({
         "status": "online",
         "service": "StaleEngine",
-        "version": "2.0.0",
+        "version": "2.1.0",
         "api_configured": API_KEY is not None,
+        "api_host": API_HOST,
         "endpoints": {
             "/find-stale": "Find listings on market 90+ days",
             "/find-distress": "Find listings with distress keywords",
