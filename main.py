@@ -1,12 +1,11 @@
 import os
 import json
 import logging
-import random
-import time
 import re
+import random
 from flask import Flask, jsonify, request
 import requests
-from urllib.parse import quote
+from urllib.parse import quote, urlencode
 
 # --- LOGGING ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
@@ -15,6 +14,7 @@ logger = logging.getLogger(__name__)
 app = Flask(__name__)
 
 PORT = int(os.environ.get("PORT", 8080))
+SCRAPER_API_KEY = os.getenv("SCRAPER_API_KEY")
 DEFAULT_STALE_DAYS = 90
 
 DISTRESS_KEYWORDS = [
@@ -24,342 +24,257 @@ DISTRESS_KEYWORDS = [
     "distressed", "below market", "bring offers", "price reduced"
 ]
 
-USER_AGENTS = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:123.0) Gecko/20100101 Firefox/123.0",
-]
+if not SCRAPER_API_KEY:
+    logger.warning("SCRAPER_API_KEY not set - scraping will fail")
+else:
+    logger.info(f"StaleEngine ready with ScraperAPI (key length: {len(SCRAPER_API_KEY)})")
 
 
-def get_search_query_state(location: str, page: int = 1) -> dict:
-    """Build Zillow's search query state object."""
+def scrape_with_scraperapi(url: str) -> str:
+    """Fetch URL through ScraperAPI proxy."""
     
-    # Determine if location is a ZIP code
-    is_zip = location.strip().isdigit() and len(location.strip()) == 5
+    api_url = "https://api.scraperapi.com"
     
-    if is_zip:
-        region_type = "zipcode"
-        search_term = location.strip()
-    else:
-        region_type = "city"
-        search_term = location.strip()
+    params = {
+        "api_key": SCRAPER_API_KEY,
+        "url": url,
+        "render": "false",  # Set to true if JS rendering needed
+        "country_code": "us",
+    }
     
-    return {
+    logger.info(f"Fetching via ScraperAPI: {url}")
+    
+    response = requests.get(api_url, params=params, timeout=60)
+    response.raise_for_status()
+    
+    return response.text
+
+
+def build_zillow_url(location: str, page: int = 1) -> str:
+    """Build Zillow search URL."""
+    location = location.strip()
+    location_slug = location.replace(" ", "-").replace(",", "").replace("--", "-")
+    
+    base_url = f"https://www.zillow.com/{location_slug}/for_sale/"
+    
+    if page > 1:
+        base_url += f"{page}_p/"
+    
+    # Add sort by days on market
+    base_url += "?searchQueryState=" + quote(json.dumps({
         "pagination": {"currentPage": page},
         "isMapVisible": False,
         "filterState": {
-            "sortSelection": {"value": "days"},  # Sort by days on Zillow
-            "isAllHomes": {"value": True},
-            "isForSaleByAgent": {"value": True},
-            "isForSaleByOwner": {"value": True},
-            "isNewConstruction": {"value": False},
-            "isForSaleForeclosure": {"value": True},
-            "isComingSoon": {"value": False},
-            "isAuction": {"value": True},
+            "sortSelection": {"value": "days"},
+            "isAllHomes": {"value": True}
         },
-        "isListVisible": True,
-        "mapZoom": 11,
-        "usersSearchTerm": search_term
-    }
+        "isListVisible": True
+    }))
+    
+    return base_url
 
 
-def search_zillow_api(location: str, page: int = 1) -> list:
-    """
-    Use Zillow's internal search API.
-    This is the same API their frontend uses.
-    """
+def extract_listings_from_html(html: str) -> list:
+    """Extract property listings from Zillow HTML."""
     
-    # Zillow's internal API endpoint
-    api_url = "https://www.zillow.com/async-create-search-page-state"
+    properties = []
     
-    # Build the search request
-    search_query = get_search_query_state(location, page)
+    # Method 1: Look for __NEXT_DATA__ JSON
+    next_data_match = re.search(
+        r'<script id="__NEXT_DATA__" type="application/json">(.*?)</script>',
+        html, re.DOTALL
+    )
     
-    payload = {
-        "searchQueryState": search_query,
-        "wants": {
-            "cat1": ["listResults"],
-            "cat2": ["total"]
-        },
-        "requestId": random.randint(1, 10),
-        "isDebugRequest": False
-    }
+    if next_data_match:
+        try:
+            data = json.loads(next_data_match.group(1))
+            
+            # Navigate to find listResults
+            props = data.get("props", {})
+            page_props = props.get("pageProps", {})
+            search_state = page_props.get("searchPageState", {})
+            cat1 = search_state.get("cat1", {})
+            search_results = cat1.get("searchResults", {})
+            list_results = search_results.get("listResults", [])
+            
+            if list_results:
+                logger.info(f"Found {len(list_results)} listings via __NEXT_DATA__")
+                return list_results
+                
+        except json.JSONDecodeError as e:
+            logger.error(f"Failed to parse __NEXT_DATA__: {e}")
     
-    headers = {
-        "User-Agent": random.choice(USER_AGENTS),
-        "Accept": "*/*",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Content-Type": "application/json",
-        "Origin": "https://www.zillow.com",
-        "Referer": f"https://www.zillow.com/{quote(location)}/",
-        "Sec-Ch-Ua": '"Chromium";v="122", "Not(A:Brand";v="24", "Google Chrome";v="122"',
-        "Sec-Ch-Ua-Mobile": "?0",
-        "Sec-Ch-Ua-Platform": '"Windows"',
-        "Sec-Fetch-Dest": "empty",
-        "Sec-Fetch-Mode": "cors",
-        "Sec-Fetch-Site": "same-origin",
-    }
+    # Method 2: Look for inline listResults
+    list_results_match = re.search(
+        r'"listResults"\s*:\s*(\[.*?\])\s*,\s*"mapResults"',
+        html, re.DOTALL
+    )
     
-    # Add delay
-    time.sleep(random.uniform(0.3, 0.8))
+    if list_results_match:
+        try:
+            list_results = json.loads(list_results_match.group(1))
+            logger.info(f"Found {len(list_results)} listings via listResults pattern")
+            return list_results
+        except:
+            pass
+    
+    # Method 3: Look for any JSON array with zpid
+    zpid_arrays = re.findall(
+        r'\[(?:[^]]*"zpid"[^]]*)\]',
+        html
+    )
+    
+    for arr_str in zpid_arrays:
+        try:
+            arr = json.loads(arr_str)
+            if isinstance(arr, list) and len(arr) > 0 and isinstance(arr[0], dict):
+                if "zpid" in arr[0] or "address" in arr[0]:
+                    logger.info(f"Found {len(arr)} listings via zpid pattern")
+                    return arr
+        except:
+            continue
+    
+    logger.warning("Could not extract listings from HTML")
+    return properties
+
+
+def search_zillow(location: str, page: int = 1) -> list:
+    """Search Zillow for listings."""
+    
+    if not SCRAPER_API_KEY:
+        raise ValueError("SCRAPER_API_KEY not configured")
+    
+    url = build_zillow_url(location, page)
     
     try:
-        logger.info(f"Searching Zillow API for: {location} (page {page})")
+        html = scrape_with_scraperapi(url)
         
-        response = requests.put(
-            api_url,
-            json=payload,
-            headers=headers,
-            timeout=15
-        )
+        # Check for blocks/errors
+        if "captcha" in html.lower():
+            logger.error("Hit CAPTCHA - ScraperAPI should handle this, retrying...")
+            # Retry with render=true
+            html = scrape_with_scraperapi_render(url)
         
-        if response.status_code == 403:
-            logger.warning("API returned 403 - trying alternative method")
-            return search_zillow_graphql(location, page)
+        listings = extract_listings_from_html(html)
+        return listings
         
-        response.raise_for_status()
-        data = response.json()
-        
-        # Extract results
-        cat1 = data.get("cat1", {})
-        search_results = cat1.get("searchResults", {})
-        list_results = search_results.get("listResults", [])
-        
-        logger.info(f"Found {len(list_results)} listings")
-        return list_results
-        
-    except Exception as e:
-        logger.error(f"API search failed: {e}")
-        # Try fallback
-        return search_zillow_graphql(location, page)
+    except requests.exceptions.RequestException as e:
+        logger.error(f"ScraperAPI request failed: {e}")
+        raise
 
 
-def search_zillow_graphql(location: str, page: int = 1) -> list:
-    """
-    Fallback: Use Zillow's GraphQL endpoint.
-    """
+def scrape_with_scraperapi_render(url: str) -> str:
+    """Fetch URL with JavaScript rendering enabled."""
     
-    url = "https://www.zillow.com/graphql/"
+    api_url = "https://api.scraperapi.com"
     
-    # GraphQL query for property search
-    query = """
-    query SearchResultsQuery($searchQueryState: SearchQueryState!) {
-        searchResults(searchQueryState: $searchQueryState) {
-            listResults {
-                zpid
-                address
-                price
-                beds
-                baths
-                area
-                daysOnZillow
-                statusText
-                detailUrl
-                imgSrc
-                homeType
-                zestimate
-            }
-            totalResultCount
-        }
-    }
-    """
-    
-    variables = {
-        "searchQueryState": get_search_query_state(location, page)
+    params = {
+        "api_key": SCRAPER_API_KEY,
+        "url": url,
+        "render": "true",
+        "country_code": "us",
+        "wait_for_selector": "article",
     }
     
-    headers = {
-        "User-Agent": random.choice(USER_AGENTS),
-        "Accept": "application/json",
-        "Content-Type": "application/json",
-        "Origin": "https://www.zillow.com",
-        "Referer": "https://www.zillow.com/",
-    }
+    logger.info(f"Fetching with JS render: {url}")
     
-    try:
-        response = requests.post(
-            url,
-            json={"query": query, "variables": variables},
-            headers=headers,
-            timeout=15
-        )
-        
-        if response.status_code != 200:
-            logger.warning(f"GraphQL returned {response.status_code}")
-            return search_redfin_fallback(location)
-        
-        data = response.json()
-        results = data.get("data", {}).get("searchResults", {}).get("listResults", [])
-        return results
-        
-    except Exception as e:
-        logger.error(f"GraphQL search failed: {e}")
-        return search_redfin_fallback(location)
-
-
-def search_redfin_fallback(location: str) -> list:
-    """
-    Ultimate fallback: Try Redfin instead.
-    """
-    logger.info(f"Trying Redfin fallback for: {location}")
+    response = requests.get(api_url, params=params, timeout=90)
+    response.raise_for_status()
     
-    # Redfin's search endpoint
-    search_url = "https://www.redfin.com/stingray/do/location-autocomplete"
-    
-    headers = {
-        "User-Agent": random.choice(USER_AGENTS),
-        "Accept": "application/json",
-    }
-    
-    try:
-        # First get region ID
-        response = requests.get(
-            search_url,
-            params={"location": location, "v": "2"},
-            headers=headers,
-            timeout=10
-        )
-        
-        # Redfin returns JSONP-like response
-        text = response.text
-        if text.startswith("{}&&"):
-            text = text[4:]
-        
-        data = json.loads(text)
-        
-        if not data.get("payload", {}).get("sections"):
-            return []
-        
-        # Get first matching region
-        sections = data["payload"]["sections"]
-        if not sections:
-            return []
-        
-        first_section = sections[0]
-        if not first_section.get("rows"):
-            return []
-        
-        region = first_section["rows"][0]
-        region_url = region.get("url", "")
-        
-        if not region_url:
-            return []
-        
-        # Now fetch listings for this region
-        gis_url = f"https://www.redfin.com/stingray/api/gis"
-        
-        # Get region params
-        response2 = requests.get(
-            f"https://www.redfin.com{region_url}",
-            headers=headers,
-            timeout=10
-        )
-        
-        # Extract listings from page
-        html = response2.text
-        
-        # Find the JSON data in the page
-        pattern = r'window\.__reactServerState\s*=\s*({.*?});'
-        match = re.search(pattern, html, re.DOTALL)
-        
-        if match:
-            try:
-                state = json.loads(match.group(1))
-                homes = state.get("ReactServerAgent.cache", {})
-                # Navigate to find homes
-                for key, value in homes.items():
-                    if "homes" in str(value).lower():
-                        if isinstance(value, dict) and "res" in value:
-                            res = value["res"]
-                            if isinstance(res, dict):
-                                homes_list = res.get("homes", [])
-                                if homes_list:
-                                    return convert_redfin_to_zillow_format(homes_list)
-            except:
-                pass
-        
-        return []
-        
-    except Exception as e:
-        logger.error(f"Redfin fallback failed: {e}")
-        return []
-
-
-def convert_redfin_to_zillow_format(redfin_homes: list) -> list:
-    """Convert Redfin data to Zillow-like format."""
-    converted = []
-    for home in redfin_homes:
-        converted.append({
-            "zpid": home.get("propertyId") or home.get("listingId"),
-            "address": home.get("streetLine", {}).get("value", "") if isinstance(home.get("streetLine"), dict) else str(home.get("streetLine", "")),
-            "price": home.get("price", {}).get("value", 0) if isinstance(home.get("price"), dict) else home.get("price", 0),
-            "beds": home.get("beds"),
-            "baths": home.get("baths"),
-            "area": home.get("sqFt", {}).get("value", 0) if isinstance(home.get("sqFt"), dict) else home.get("sqFt", 0),
-            "daysOnZillow": home.get("dom", 0),  # Days on market
-            "statusText": home.get("listingRemarks", ""),
-            "detailUrl": home.get("url", ""),
-            "imgSrc": home.get("primaryPhotoDisplayLevel", {}).get("photoUrl", "") if isinstance(home.get("primaryPhotoDisplayLevel"), dict) else "",
-            "homeType": home.get("propertyType", ""),
-        })
-    return converted
+    return response.text
 
 
 def normalize_property(prop: dict) -> dict:
-    """Normalize property data."""
+    """Normalize property data to standard format."""
     
+    # Address
     address = prop.get("address", "")
     if isinstance(address, dict):
-        address = address.get("streetAddress", "")
+        address = address.get("streetAddress", "") or f"{address.get('city', '')}, {address.get('state', '')}"
     
-    price = prop.get("price", 0)
+    # Price
+    price = prop.get("price", 0) or prop.get("unformattedPrice", 0)
     if isinstance(price, str):
         price = int(''.join(filter(str.isdigit, price)) or 0)
     
-    days_on = prop.get("daysOnZillow", 0) or prop.get("dom", 0)
+    # Days on market
+    days_on = prop.get("daysOnZillow", 0)
+    if not days_on:
+        var_data = prop.get("variableData", {})
+        if isinstance(var_data, dict):
+            text = var_data.get("text", "")
+            match = re.search(r'(\d+)\s*day', text.lower())
+            if match:
+                days_on = int(match.group(1))
     
-    detail_url = prop.get("detailUrl", "")
+    # URL
+    detail_url = prop.get("detailUrl", "") or prop.get("hdpUrl", "")
     if detail_url and not detail_url.startswith("http"):
         detail_url = f"https://www.zillow.com{detail_url}"
     
+    # Status text for keyword matching
+    status = prop.get("statusText", "")
+    var_text = ""
+    if isinstance(prop.get("variableData"), dict):
+        var_text = prop["variableData"].get("text", "")
+    
     return {
-        "zpid": prop.get("zpid"),
+        "zpid": prop.get("zpid") or prop.get("id"),
         "address": address,
+        "city": prop.get("addressCity", ""),
+        "state": prop.get("addressState", ""),
+        "zip": prop.get("addressZipcode", ""),
         "price": price,
         "bedrooms": prop.get("beds", 0),
         "bathrooms": prop.get("baths", 0),
-        "sqft": prop.get("area", 0),
+        "sqft": prop.get("area", 0) or prop.get("livingArea", 0),
+        "lot_size": prop.get("lotAreaValue", 0),
         "property_type": prop.get("homeType", ""),
         "days_on_market": days_on,
-        "status_text": prop.get("statusText", ""),
+        "status_text": status,
         "zestimate": prop.get("zestimate", 0),
+        "rent_zestimate": prop.get("rentZestimate", 0),
         "url": detail_url,
-        "image": prop.get("imgSrc", "")
+        "image": prop.get("imgSrc", ""),
+        "broker": prop.get("brokerName", ""),
+        "_raw_variable_text": var_text
     }
 
 
 def find_stale(properties: list, min_days: int) -> list:
-    """Find stale listings."""
+    """Find stale listings (on market too long)."""
     leads = []
     for prop in properties:
         norm = normalize_property(prop)
         if norm["days_on_market"] >= min_days:
             norm["signal"] = "STALE"
+            # Remove internal field
+            norm.pop("_raw_variable_text", None)
             leads.append(norm)
     return sorted(leads, key=lambda x: x["days_on_market"], reverse=True)
 
 
 def find_distress(properties: list) -> list:
-    """Find distress keyword matches."""
+    """Find listings with distress keywords."""
     leads = []
     for prop in properties:
         norm = normalize_property(prop)
-        text = f"{norm.get('address', '')} {norm.get('status_text', '')}".lower()
-        matched = [kw for kw in DISTRESS_KEYWORDS if kw in text]
+        
+        # Search all text fields
+        search_text = " ".join([
+            str(norm.get("address", "")),
+            str(norm.get("status_text", "")),
+            str(norm.get("_raw_variable_text", "")),
+        ]).lower()
+        
+        matched = [kw for kw in DISTRESS_KEYWORDS if kw in search_text]
+        
         if matched:
             norm["signal"] = "DISTRESS"
             norm["matched_keywords"] = matched
+            norm.pop("_raw_variable_text", None)
             leads.append(norm)
+    
     return leads
 
 
@@ -370,13 +285,13 @@ def health():
     return jsonify({
         "status": "online",
         "service": "StaleEngine",
-        "version": "6.0.0",
-        "description": "Real estate stale listing finder",
+        "version": "7.0.0",
+        "scraper_api_configured": SCRAPER_API_KEY is not None,
         "endpoints": {
-            "GET /find-stale?location=Houston,TX": "Listings 90+ days on market",
+            "GET /find-stale?location=Houston,TX": "Find listings 90+ days on market",
             "GET /find-stale?location=77001&days=60": "Custom days threshold",
-            "GET /find-distress?location=Phoenix,AZ": "Distress keyword matches",
-            "GET /search?location=Miami,FL": "Combined search"
+            "GET /find-distress?location=Phoenix,AZ": "Find distress keywords",
+            "GET /search?location=Miami,FL": "Combined stale + distress search"
         }
     })
 
@@ -388,16 +303,26 @@ def route_find_stale():
     page = request.args.get('page', 1, type=int)
     
     if not location:
-        return jsonify({"success": False, "error": "Missing 'location' parameter"}), 400
+        return jsonify({
+            "success": False, 
+            "error": "Missing 'location' parameter",
+            "example": "/find-stale?location=Chicago,IL&days=90"
+        }), 400
+    
+    if not SCRAPER_API_KEY:
+        return jsonify({
+            "success": False,
+            "error": "SCRAPER_API_KEY not configured in environment"
+        }), 500
     
     try:
-        properties = search_zillow_api(location, page)
+        properties = search_zillow(location, page)
         
         if not properties:
             return jsonify({
                 "success": True,
                 "location": location,
-                "message": "No properties found or service unavailable",
+                "message": "No properties found. Try different location format (e.g., 'Chicago IL' or '60601')",
                 "results_count": 0,
                 "leads": []
             })
@@ -408,7 +333,7 @@ def route_find_stale():
             "success": True,
             "location": location,
             "filter": f"{days}+ days on market",
-            "total_found": len(properties),
+            "total_scraped": len(properties),
             "results_count": len(leads),
             "page": page,
             "leads": leads
@@ -416,7 +341,10 @@ def route_find_stale():
         
     except Exception as e:
         logger.exception("Error in find-stale")
-        return jsonify({"success": False, "error": str(e)}), 500
+        return jsonify({
+            "success": False,
+            "error": str(e)
+        }), 500
 
 
 @app.route('/find-distress', methods=['GET'])
@@ -427,8 +355,11 @@ def route_find_distress():
     if not location:
         return jsonify({"success": False, "error": "Missing 'location' parameter"}), 400
     
+    if not SCRAPER_API_KEY:
+        return jsonify({"success": False, "error": "SCRAPER_API_KEY not configured"}), 500
+    
     try:
-        properties = search_zillow_api(location, page)
+        properties = search_zillow(location, page)
         
         if not properties:
             return jsonify({
@@ -446,7 +377,7 @@ def route_find_distress():
             "location": location,
             "filter": "distress keywords",
             "keywords": DISTRESS_KEYWORDS,
-            "total_found": len(properties),
+            "total_scraped": len(properties),
             "results_count": len(leads),
             "page": page,
             "leads": leads
@@ -466,8 +397,11 @@ def route_search():
     if not location:
         return jsonify({"success": False, "error": "Missing 'location' parameter"}), 400
     
+    if not SCRAPER_API_KEY:
+        return jsonify({"success": False, "error": "SCRAPER_API_KEY not configured"}), 500
+    
     try:
-        properties = search_zillow_api(location, page)
+        properties = search_zillow(location, page)
         
         if not properties:
             return jsonify({
@@ -482,6 +416,7 @@ def route_search():
         stale = find_stale(properties, days)
         distress = find_distress(properties)
         
+        # Hot leads = both stale AND distressed
         stale_ids = {p["zpid"] for p in stale if p.get("zpid")}
         distress_ids = {p["zpid"] for p in distress if p.get("zpid")}
         hot_ids = stale_ids & distress_ids
@@ -490,7 +425,7 @@ def route_search():
             "success": True,
             "location": location,
             "page": page,
-            "total_found": len(properties),
+            "total_scraped": len(properties),
             "summary": {
                 "stale": len(stale),
                 "distress": len(distress),
@@ -508,7 +443,10 @@ def route_search():
 
 @app.errorhandler(404)
 def not_found(e):
-    return jsonify({"error": "Not found", "endpoints": ["/", "/find-stale", "/find-distress", "/search"]}), 404
+    return jsonify({
+        "error": "Endpoint not found",
+        "endpoints": ["/", "/find-stale", "/find-distress", "/search"]
+    }), 404
 
 
 if __name__ == "__main__":
