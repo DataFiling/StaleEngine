@@ -223,12 +223,12 @@ def normalize_property(prop: dict) -> dict:
     if not days_on:
         days_on = prop.get("daysOnZillow", 0) or prop.get("timeOnZillow", 0)
     
-    # If value is very large, it's likely milliseconds - convert to days
-    if days_on and days_on > 10000:
-        # Convert milliseconds to days
-        days_on = days_on // (1000 * 60 * 60 * 24)
+    # If value is very large, it's likely seconds - convert to days
+    # 86400 seconds = 1 day
+    if days_on and days_on > 1000:
+        days_on = days_on // 86400
     
-    # Check variableData text
+    # Check variableData text for "X days" pattern
     if not days_on:
         var_data = prop.get("variableData", {})
         if isinstance(var_data, dict):
