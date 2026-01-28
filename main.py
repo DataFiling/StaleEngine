@@ -221,7 +221,12 @@ def normalize_property(prop: dict) -> dict:
     
     # Direct field
     if not days_on:
-        days_on = prop.get("daysOnZillow", 0)
+        days_on = prop.get("daysOnZillow", 0) or prop.get("timeOnZillow", 0)
+    
+    # If value is very large, it's likely milliseconds - convert to days
+    if days_on and days_on > 10000:
+        # Convert milliseconds to days
+        days_on = days_on // (1000 * 60 * 60 * 24)
     
     # Check variableData text
     if not days_on:
