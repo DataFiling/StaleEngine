@@ -103,7 +103,14 @@ def extract_listings_from_html(html: str) -> list:
                 if list_results and len(list_results) > 0:
                     first = list_results[0]
                     logger.info(f"Sample listing keys: {list(first.keys())}")
-                    logger.info(f"Sample listing data: {json.dumps(first, default=str)[:1000]}")
+                    # Log hdpData specifically
+                    hdp = first.get("hdpData", {})
+                    if hdp:
+                        logger.info(f"hdpData keys: {list(hdp.keys()) if isinstance(hdp, dict) else 'not a dict'}")
+                        home_info = hdp.get("homeInfo", {}) if isinstance(hdp, dict) else {}
+                        if home_info:
+                            logger.info(f"homeInfo keys: {list(home_info.keys())}")
+                            logger.info(f"daysOnZillow: {home_info.get('daysOnZillow', 'NOT FOUND')}")
                 return list_results
                 
         except json.JSONDecodeError as e:
@@ -193,22 +200,43 @@ def normalize_property(prop: dict) -> dict:
     """Normalize property data to standard format."""
     
     # Address
-    address = prop.get("address", "")
+    address = prop.get("address", "") or prop.get("addressStreet", "")
     if isinstance(address, dict):
         address = address.get("streetAddress", "") or f"{address.get('city', '')}, {address.get('state', '')}"
     
     # Price
-    price = prop.get("price", 0) or prop.get("unformattedPrice", 0)
+    price = prop.get("unformattedPrice", 0) or prop.get("price", 0)
     if isinstance(price, str):
         price = int(''.join(filter(str.isdigit, price)) or 0)
     
-    # Days on market
-    days_on = prop.get("daysOnZillow", 0)
+    # Days on market - check multiple locations
+    days_on = 0
+    
+    # Check hdpData.homeInfo
+    hdp_data = prop.get("hdpData", {})
+    if isinstance(hdp_data, dict):
+        home_info = hdp_data.get("homeInfo", {})
+        if isinstance(home_info, dict):
+            days_on = home_info.get("daysOnZillow", 0) or home_info.get("timeOnZillow", 0)
+    
+    # Direct field
+    if not days_on:
+        days_on = prop.get("daysOnZillow", 0)
+    
+    # Check variableData text
     if not days_on:
         var_data = prop.get("variableData", {})
         if isinstance(var_data, dict):
             text = var_data.get("text", "")
             match = re.search(r'(\d+)\s*day', text.lower())
+            if match:
+                days_on = int(match.group(1))
+    
+    # Check flexFieldText (sometimes has "X days on Zillow")
+    if not days_on:
+        flex_text = prop.get("flexFieldText", "")
+        if flex_text:
+            match = re.search(r'(\d+)\s*day', flex_text.lower())
             if match:
                 days_on = int(match.group(1))
     
@@ -219,9 +247,8 @@ def normalize_property(prop: dict) -> dict:
     
     # Status text for keyword matching
     status = prop.get("statusText", "")
-    var_text = ""
-    if isinstance(prop.get("variableData"), dict):
-        var_text = prop["variableData"].get("text", "")
+    marketing_status = prop.get("marketingStatusSimplifiedCd", "")
+    flex_text = prop.get("flexFieldText", "")
     
     return {
         "zpid": prop.get("zpid") or prop.get("id"),
@@ -232,17 +259,14 @@ def normalize_property(prop: dict) -> dict:
         "price": price,
         "bedrooms": prop.get("beds", 0),
         "bathrooms": prop.get("baths", 0),
-        "sqft": prop.get("area", 0) or prop.get("livingArea", 0),
-        "lot_size": prop.get("lotAreaValue", 0),
-        "property_type": prop.get("homeType", ""),
+        "sqft": prop.get("area", 0),
+        "property_type": prop.get("homeType", "") or marketing_status,
         "days_on_market": days_on,
-        "status_text": status,
+        "status_text": f"{status} {marketing_status} {flex_text}".strip(),
         "zestimate": prop.get("zestimate", 0),
-        "rent_zestimate": prop.get("rentZestimate", 0),
         "url": detail_url,
         "image": prop.get("imgSrc", ""),
-        "broker": prop.get("brokerName", ""),
-        "_raw_variable_text": var_text
+        "_search_text": f"{address} {status} {marketing_status} {flex_text}".lower()
     }
 
 
@@ -253,8 +277,7 @@ def find_stale(properties: list, min_days: int) -> list:
         norm = normalize_property(prop)
         if norm["days_on_market"] >= min_days:
             norm["signal"] = "STALE"
-            # Remove internal field
-            norm.pop("_raw_variable_text", None)
+            norm.pop("_search_text", None)
             leads.append(norm)
     return sorted(leads, key=lambda x: x["days_on_market"], reverse=True)
 
@@ -265,19 +288,15 @@ def find_distress(properties: list) -> list:
     for prop in properties:
         norm = normalize_property(prop)
         
-        # Search all text fields
-        search_text = " ".join([
-            str(norm.get("address", "")),
-            str(norm.get("status_text", "")),
-            str(norm.get("_raw_variable_text", "")),
-        ]).lower()
+        # Use pre-built search text
+        search_text = norm.get("_search_text", "")
         
         matched = [kw for kw in DISTRESS_KEYWORDS if kw in search_text]
         
         if matched:
             norm["signal"] = "DISTRESS"
             norm["matched_keywords"] = matched
-            norm.pop("_raw_variable_text", None)
+            norm.pop("_search_text", None)
             leads.append(norm)
     
     return leads
