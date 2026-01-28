@@ -16,8 +16,8 @@ app = Flask(__name__)
 
 # --- CONFIGURATION ---
 API_KEY = os.getenv("RAPIDAPI_KEY")
-# Use Real-Time Zillow Data API (actively maintained) - switch if needed
-API_HOST = os.getenv("ZILLOW_API_HOST", "real-time-zillow-data.p.rapidapi.com")
+# Zillow Working API as default, can override with env var
+API_HOST = os.getenv("ZILLOW_API_HOST", "zillow-working-api.p.rapidapi.com")
 PORT = int(os.environ.get("PORT", 8080))
 
 # Thresholds
